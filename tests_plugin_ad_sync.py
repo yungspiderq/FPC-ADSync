@@ -64,12 +64,13 @@ sys.modules["telebot.types"] = types_stub
 sys.modules["telebot.apihelper"] = apihelper_stub
 
 # ── загрузка модуля ──
-PLUGINS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins")
+PLUGINS_DIR = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location(
     "plugins.ad_sync", os.path.join(PLUGINS_DIR, "ad_sync.py"))
 mod = importlib.util.module_from_spec(spec)
 sys.modules["plugins.ad_sync"] = mod
 spec.loader.exec_module(mod)
+mod.CBT = SimpleNamespace(PLUGIN_SETTINGS="47", EDIT_PLUGIN="45")
 
 PASS = FAIL = 0
 
@@ -90,6 +91,7 @@ class MockLotFields:
         self.lot_id = int(lot_id)
         self.secrets = list(secrets)
         self.auto_delivery = auto_delivery
+        self.active = True
 
 
 class MockAccount:
@@ -110,11 +112,14 @@ class MockAccount:
         if lot_id not in self.store:
             raise RuntimeError(f"lot {lot_id} not found")
         src = self.store[lot_id]
-        return MockLotFields(src.lot_id, src.secrets, src.auto_delivery)
+        fields = MockLotFields(src.lot_id, src.secrets, src.auto_delivery)
+        fields.active = src.active
+        return fields
 
     def save_lot(self, fields, *args):
         self.saved.append(int(fields.lot_id))
         self.store[int(fields.lot_id)].secrets = list(fields.secrets)
+        self.store[int(fields.lot_id)].active = fields.active
         return True
 
 
@@ -243,9 +248,11 @@ def find_msg_for(tg, m):
 
 
 def init_plugin(crd):
+    from unittest.mock import patch
     crd.telegram = TestTG()
     mod._stop_event.clear()
-    mod.init(crd)
+    with patch.object(mod, "_sync_loop", lambda *args: None):
+        mod.init(crd)
 
 
 # ══════════════════════════════════ ТЕСТЫ ═══════════════════════════════════════
@@ -257,7 +264,7 @@ def test_metadata():
     section("МЕТАДАННЫЕ ПЛАГИНА")
     check(str(UUID(mod.UUID, version=4)) == mod.UUID, f"UUID валиден ({mod.UUID})")
     check(mod.NAME == "ADSync (FunPay Auto-Delivery Sync)", f"NAME английский: {mod.NAME}")
-    check(mod.VERSION == "1.0.0", f"VERSION = {mod.VERSION}")
+    check(mod.VERSION == "1.0.1", f"VERSION = {mod.VERSION}")
     check(mod.CREDITS == "yungspider", "CREDITS = yungspider")
     check(mod.BIND_TO_PRE_INIT == [mod.init], "BIND_TO_PRE_INIT = [init]")
     check(mod.BIND_TO_NEW_ORDER == [mod.new_order_handler], "BIND_TO_NEW_ORDER")
@@ -416,9 +423,9 @@ def test_new_order_sync():
         settings["groups"][0]["enabled"] = True
         mod._save_settings(settings)
 
-        # без lot_id / плагин выключен
-        mod.new_order_handler(crd, SimpleNamespace())
+        # Выключенный плагин не запускает синхронизацию даже без lot_id.
         crd.plugins[mod.UUID].enabled = False
+        mod.new_order_handler(crd, SimpleNamespace())
         store[11].secrets = ["a1", "a2"]
         mod.new_order_handler(crd, SimpleNamespace(lot_id=11))
         time.sleep(0.3)

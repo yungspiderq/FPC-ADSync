@@ -31,11 +31,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import tempfile
 import threading
 import time
 from datetime import datetime
+from functools import wraps
 from typing import TYPE_CHECKING
 
 from telebot.types import InlineKeyboardMarkup as K, InlineKeyboardButton as B, CallbackQuery, Message
@@ -55,7 +58,7 @@ logger = logging.getLogger("FPC.ADSync")
 
 # ══════════════════════════════ МЕТАДАННЫЕ ПЛАГИНА ══════════════════════════════
 NAME = "ADSync (FunPay Auto-Delivery Sync)"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 DESCRIPTION = ("Синхронизация встроенной автовыдачи FunPay на несколько лотов сразу: одинаковое "
                "содержимое поля товаров у всех лотов группы. Продажа на одном лоте убирает товар "
                "со всех остальных, пополнение расходится на все. Команда: /adsync")
@@ -94,9 +97,18 @@ ST_GNAME = "ads:st:gname"
 ST_INT = "ads:st:int"
 
 _stop_event = threading.Event()
-_settings_lock = threading.Lock()
-_sync_lock = threading.Lock()
+_sync_lock = threading.RLock()
+_settings_lock = _sync_lock
 _cardinal: "Cardinal | None" = None
+
+
+def _serialized(func):
+    """Keep load → network operations → save in one transaction across threads."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        with _sync_lock:
+            return func(*args, **kwargs)
+    return wrapped
 
 
 # ══════════════════════════════ УТИЛИТЫ ═════════════════════════════════════════
@@ -129,9 +141,14 @@ def _normalize_group(g: dict, fallback_id: int) -> dict | None:
     last = g.get("last")
     if not isinstance(last, dict):
         last = {}
+    removed_hashes = g.get("removed_hashes", [])
+    if not isinstance(removed_hashes, list) or any(
+            not isinstance(h, str) or len(h) != 64 or
+            any(c not in "0123456789abcdef" for c in h) for h in removed_hashes):
+        raise ValueError("ADSync: поврежден журнал удаленных товаров")
     return {"id": gid, "name": str(g.get("name") or f"Группа {gid}")[:60],
             "enabled": bool(g.get("enabled", True)), "lots": lots,
-            "baseline": baseline, "last": last}
+            "baseline": baseline, "last": last, "removed_hashes": removed_hashes}
 
 
 def _load_settings() -> dict:
@@ -142,9 +159,11 @@ def _load_settings() -> dict:
                 with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
-                logger.error("ADSync: не удалось прочитать настройки, использую значения по умолчанию.")
+                logger.error("ADSync: не удалось прочитать настройки. Синхронизация остановлена.")
                 logger.debug("TRACEBACK", exc_info=True)
-                data = {}
+                raise
+        if not isinstance(data, dict):
+            raise ValueError("ADSync: неверный формат настроек")
         settings = json.loads(json.dumps(DEFAULT_SETTINGS))
         if isinstance(data, dict):
             settings.update({k: v for k, v in data.items() if k in settings})
@@ -164,13 +183,39 @@ def _load_settings() -> dict:
 
 def _save_settings(settings: dict) -> None:
     with _settings_lock:
+        temp_path = None
         try:
             os.makedirs(PLUGIN_DIR, exist_ok=True)
-            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=PLUGIN_DIR,
+                                             suffix=".tmp", delete=False) as f:
+                temp_path = f.name
                 json.dump(settings, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, SETTINGS_PATH)
         except Exception:
             logger.error("ADSync: не удалось сохранить настройки.")
             logger.debug("TRACEBACK", exc_info=True)
+            raise
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+
+def _fingerprint(secret: str) -> str:
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def _checkpoint(group: dict) -> None:
+    """Persist deletion evidence BEFORE any remote write, including empty stock."""
+    settings = _load_settings()
+    saved = _get_group(settings, group["id"])
+    if saved is None:
+        raise ValueError("ADSync: группа удалена; синхронизация отменена")
+    for key in ("baseline", "removed_hashes", "last"):
+        if key in group:
+            saved[key] = group[key]
+    _save_settings(settings)
 
 
 def _get_group(settings: dict, gid: int) -> dict | None:
@@ -239,7 +284,30 @@ def _merge_secrets(baseline: list, current: dict) -> tuple:
     return merged, len(removed), len(added)
 
 
+@_serialized
 def sync_group(crd: "Cardinal", group: dict) -> dict | None:
+    # A queued task must never use the baseline loaded before another task sold stock.
+    fresh = _get_group(_load_settings(), group["id"])
+    if fresh is None:
+        return None
+    group.update(fresh)
+    changed, removed, added = set(), 0, 0
+    for _ in range(3):
+        report = _sync_group_pass(crd, group)
+        if report is None:
+            return None
+        changed.update(report["changed"])
+        removed += report["removed"]
+        added += report["added"]
+        if not report.pop("retry", False):
+            break
+    report.update(changed=sorted(changed), removed=removed, added=added)
+    group["last"]["changed"] = len(changed)
+    _checkpoint(group)
+    return report
+
+
+def _sync_group_pass(crd: "Cardinal", group: dict) -> dict | None:
     """
     Один проход синхронизации группы. Изменяет group["baseline"]/["last"] на месте.
     Возвращает отчет {"changed": [lot_id...], "total": int, "removed": int, "added": int,
@@ -248,6 +316,7 @@ def sync_group(crd: "Cardinal", group: dict) -> dict | None:
     with _sync_lock:
         current = {}
         no_ad = []
+        failed = []
         fields_cache = {}
         for lot_id in group["lots"]:
             if _stop_event.is_set():
@@ -258,6 +327,7 @@ def sync_group(crd: "Cardinal", group: dict) -> dict | None:
                 logger.error(f"ADSync: не удалось прочитать поля лота {lot_id} "
                              f"(группа «{group['name']}»).")
                 logger.debug("TRACEBACK", exc_info=True)
+                failed.append(lot_id)
                 continue
             fields_cache[lot_id] = fields
             current[lot_id] = list(getattr(fields, "secrets", []) or [])
@@ -268,39 +338,75 @@ def sync_group(crd: "Cardinal", group: dict) -> dict | None:
             return None
 
         baseline = group.get("baseline")
+        blocked = set(group.get("removed_hashes", []))
         if not isinstance(baseline, list):
-            # первый проход: источник — первый доступный лот группы, без слияния
+            # первый проход: источник — только первый лот группы, без слияния
             # (иначе стартовые различия лотов алгоритм слияния
             #  посчитал бы продажами и затёр товары первого лота)
-            first_id = next(lid for lid in group["lots"] if lid in current)
-            merged = list(current[first_id])
+            first_id = group["lots"][0]
+            if first_id not in current:
+                return None  # Never select a stale replica as the source.
+            merged = list(dict.fromkeys(current[first_id]))
             removed_n = added_n = 0
             logger.info(f"ADSync: группа «{group['name']}» — базовый срез взят с лота {first_id}.")
         else:
             merged, removed_n, added_n = _merge_secrets(baseline, current)
+            blocked.update(_fingerprint(s) for s in baseline if s not in merged)
+        merged = list(dict.fromkeys(s for s in merged if _fingerprint(s) not in blocked))
+        added_n = len(set(merged) - set(baseline or [])) if baseline is not None else 0
+        group["removed_hashes"] = sorted(blocked)
+        _checkpoint(group)
 
         changed = []
         for lot_id, fields in fields_cache.items():
-            if list(getattr(fields, "secrets", []) or []) == merged:
+            if (list(getattr(fields, "secrets", []) or []) == merged
+                    and (merged or not getattr(fields, "active", False))):
                 continue
             try:
+                # Do not write an old editor form over a sale made during this pass.
+                fields = crd.account.get_lot_fields(int(lot_id))
+                if list(getattr(fields, "secrets", []) or []) != current[lot_id]:
+                    group["last"] = {"ts": time.time(), "changed": len(changed),
+                                     "total": len(merged), "no_ad": no_ad, "failed": [lot_id]}
+                    return {"changed": changed, "total": len(merged), "removed": removed_n,
+                            "added": 0, "read": len(current), "no_ad": no_ad,
+                            "failed": [lot_id], "retry": True}
                 fields.secrets = list(merged)
+                if not merged:
+                    fields.active = False
                 crd.account.save_lot(fields)
-                changed.append(lot_id)
-                logger.info(f"ADSync: лот {lot_id} (группа «{group['name']}») "
-                            f"синхронизирован → {len(merged)} товаров.")
+                verified = crd.account.get_lot_fields(int(lot_id))
+                if (list(getattr(verified, "secrets", []) or []) != merged
+                        or (not merged and getattr(verified, "active", False))):
+                    # The request may have failed silently or a sale happened meanwhile.
+                    failed.append(lot_id)
+                else:
+                    changed.append(lot_id)
+                    logger.info(f"ADSync: лот {lot_id} (группа «{group['name']}») "
+                                f"синхронизирован → {len(merged)} товаров.")
                 time.sleep(SAVE_DELAY)
             except Exception:
                 logger.error(f"ADSync: не удалось сохранить лот {lot_id} (группа «{group['name']}»).")
                 logger.debug("TRACEBACK", exc_info=True)
+                failed.append(lot_id)
 
         group["baseline"] = merged
         group["last"] = {"ts": time.time(), "changed": len(changed), "total": len(merged),
-                         "no_ad": no_ad}
+                         "no_ad": no_ad, "failed": sorted(set(failed))}
         return {"changed": changed, "total": len(merged), "removed": removed_n,
-                "added": added_n, "read": len(current), "no_ad": no_ad}
+                "added": added_n, "read": len(current), "no_ad": no_ad,
+                "failed": sorted(set(failed))}
 
 
+def _failure_warning(report: dict) -> str:
+    if not report["failed"]:
+        return ""
+    ids = ", ".join(str(i) for i in report["failed"])
+    return (f"\n\n⚠️ Не удалось подтвердить остатки у лотов: <code>{ids}</code>. "
+            "Копии проданных товаров могут оставаться на этих лотах. Повторите синхронизацию.")
+
+
+@_serialized
 def _sync_all(crd: "Cardinal") -> None:
     """Периодический проход по всем включенным группам + сохранение настроек."""
     settings = _load_settings()
@@ -310,36 +416,46 @@ def _sync_all(crd: "Cardinal") -> None:
             continue
         report = sync_group(crd, group)
         if report is None:
+            if not _stop_event.is_set():
+                _notify(crd, f"⚠️ ADSync: не удалось проверить остатки группы "
+                             f"«{_escape(group['name'])}». Проверьте доступность лотов и повторите синхронизацию.")
             continue
         dirty = True
-        if report["changed"]:
-            _notify(crd, f"🔄 <b>ADSync: автовыдача синхронизирована.</b>\n\n"
+        if report["changed"] or report["failed"]:
+            _notify(crd, f"🔄 <b>ADSync: результат синхронизации.</b>\n\n"
                          f"Группа: <b>{_escape(group['name'])}</b>\n"
                          f"Товаров теперь: <b>{report['total']}</b> "
                          f"(убрано: {report['removed']}, добавлено: {report['added']})\n"
-                         f"Обновлено лотов: <b>{len(report['changed'])}</b> из {report['read']}")
+                         f"Обновлено лотов: <b>{len(report['changed'])}</b> из {report['read']}"
+                         + _failure_warning(report))
     if dirty:
         _save_settings(settings)
 
 
+@_serialized
 def _sync_group_thread(crd: "Cardinal", gid: int, report_to: int | None = None) -> None:
     """Ручная синхронизация одной группы с отчетом в чат."""
     settings = _load_settings()
     group = _get_group(settings, gid)
-    if group is None:
+    if group is None or not group["enabled"]:
         return
     report = sync_group(crd, group)  # изменяет group["baseline"]/["last"] на месте
     _save_settings(settings)         # сохраняем обновленный срез
+    if report_to and crd.telegram and report is None:
+        crd.telegram.bot.send_message(report_to, "⚠️ Не удалось проверить остатки группы. "
+                                     "Проверьте доступность лотов и повторите синхронизацию.")
     if report_to and crd.telegram and report is not None:
         if report["changed"]:
             lines = "\n".join(f"• лот <code>{lid}</code>" for lid in report["changed"])
             body = (f"Обновлено лотов: <b>{len(report['changed'])}</b> из {report['read']}:\n{lines}")
+        elif report["failed"]:
+            body = "Синхронизация не завершена."
         else:
             body = f"Изменений нет — все лоты ({report['read']}) уже синхронны."
-        warn = ""
+        warn = _failure_warning(report)
         if report["no_ad"]:
             ids = ", ".join(str(i) for i in report["no_ad"])
-            warn = f"\n\n⚠️ У лотов <code>{ids}</code> не включена встроенная автовыдача FunPay."
+            warn += f"\n\n⚠️ У лотов <code>{ids}</code> не включена встроенная автовыдача FunPay."
         try:
             crd.telegram.bot.send_message(
                 report_to, f"🔄 <b>Синхронизация группы «{_escape(group['name'])}»</b>\n\n"
@@ -357,6 +473,8 @@ def new_order_handler(c: "Cardinal", e, *args) -> None:
             return
         lot_id = getattr(e, "lot_id", None)
         if lot_id is None:
+            # The last sale can remove the lot from Cardinal's visible profile.
+            threading.Thread(target=_sync_all, args=(c,), daemon=True).start()
             return
         settings = _load_settings()
         group = _group_of_lot(settings, lot_id)
@@ -449,6 +567,9 @@ def _group_text(crd: "Cardinal", group: dict) -> str:
     if no_ad:
         ids = ", ".join(str(i) for i in no_ad)
         text += f"\n⚠️ Не включена автовыдача FunPay у лотов: <code>{ids}</code>"
+    if last.get("failed"):
+        ids = ", ".join(str(i) for i in last["failed"])
+        text += f"\n⚠️ Остатки не подтверждены у лотов: <code>{ids}</code>. Повторите синхронизацию."
     return text
 
 
@@ -540,6 +661,7 @@ def init(crd: "Cardinal", *args) -> None:
             _edit_or_send(bot, c, _home_text(crd), _home_kb(crd))
 
         # ---------- группы ----------
+        @_serialized
         def add_group(c: CallbackQuery) -> None:
             settings = _load_settings()
             gid = _next_group_id(settings)
@@ -559,6 +681,7 @@ def init(crd: "Cardinal", *args) -> None:
                 return
             _edit_or_send(bot, c, _group_text(crd, group), _group_kb(group))
 
+        @_serialized
         def toggle_group(c: CallbackQuery) -> None:
             settings = _load_settings()
             group = _get_group(settings, _gid(c))
@@ -584,6 +707,7 @@ def init(crd: "Cardinal", *args) -> None:
                                   f"<i>Сами лоты и их товары не пострадают — группа просто "
                                   f"перестанет синхронизироваться.</i>", kb)
 
+        @_serialized
         def del_group(c: CallbackQuery) -> None:
             settings = _load_settings()
             gid = _gid(c)
@@ -619,6 +743,7 @@ def init(crd: "Cardinal", *args) -> None:
                 return
             _edit_or_send(bot, c, _pick_text(crd, group), _pick_kb(crd, group, settings, offset))
 
+        @_serialized
         def toggle_lot(c: CallbackQuery) -> None:
             parts = str(c.data).split(":")
             gid, lot_id, offset = int(parts[2]), int(parts[3]), int(parts[4]) if len(parts) > 4 else 0
@@ -638,12 +763,18 @@ def init(crd: "Cardinal", *args) -> None:
                                     f"Сначала уберите его оттуда.", alert=True)
                     _edit_or_send(bot, c, _pick_text(crd, group), _pick_kb(crd, group, settings, offset))
                     return
+                # Bring existing stock up to date before copying it to a new lot.
+                if group["lots"]:
+                    report = sync_group(crd, group)
+                    if report is None or report["failed"]:
+                        _answer(bot, c, "Не удалось проверить остатки группы. Повторите позже.", alert=True)
+                        return
                 group["lots"].append(lot_id)
                 baseline = group.get("baseline")
                 _save_settings(settings)
                 if isinstance(baseline, list):
                     # сразу приводим новый лот к общему списку группы
-                    threading.Thread(target=_adopt_lot, args=(crd, gid, lot_id), daemon=True).start()
+                    _adopt_lot(crd, gid, lot_id)
                     _answer(bot, c, f"Лот {lot_id} добавлен — его товары заменяются общим "
                                     f"списком группы ({len(baseline)} шт.).")
                 else:
@@ -663,6 +794,8 @@ def init(crd: "Cardinal", *args) -> None:
                     fields = crd_.account.get_lot_fields(int(lot_id))
                     if list(getattr(fields, "secrets", []) or []) != group["baseline"]:
                         fields.secrets = list(group["baseline"])
+                        if not fields.secrets:
+                            fields.active = False
                         crd_.account.save_lot(fields)
                         logger.info(f"ADSync: лот {lot_id} приведен к списку группы «{group['name']}».")
                 except Exception:
@@ -719,6 +852,7 @@ def init(crd: "Cardinal", *args) -> None:
             except Exception:
                 return False
 
+        @_serialized
         def edit_name(m: Message) -> None:
             gid = _gid_from_state(m)
             tg.clear_state(m.chat.id, m.from_user.id, True)
@@ -735,6 +869,7 @@ def init(crd: "Cardinal", *args) -> None:
             _save_settings(settings)
             bot.reply_to(m, f"✏️ Группа переименована в «{_escape(name)}».", parse_mode="HTML")
 
+        @_serialized
         def edit_interval(m: Message) -> None:
             tg.clear_state(m.chat.id, m.from_user.id, True)
             try:
